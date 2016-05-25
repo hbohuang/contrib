@@ -39,6 +39,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller/framework"
 	"k8s.io/kubernetes/pkg/fields"
 	kubectl_util "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util"
 	"k8s.io/kubernetes/pkg/util/intstr"
 	"k8s.io/kubernetes/pkg/util/wait"
@@ -120,8 +121,9 @@ var (
 	forwardServices = flags.Bool("forward-services", false, `Forward to service vip
                 instead of endpoints. This will use kube-proxy's inbuilt load balancing.`)
 
-	httpPort  = flags.Int("http-port", 80, `Port to expose http services.`)
-	statsPort = flags.Int("stats-port", 1936, `Port for loadbalancer stats,
+	httpPort  = flags.Int("http-port", 8080, `Port to expose http services.`)
+	httpsPort = flags.Int("https-port", 443, `Port to expose https services.`)
+	statsPort = flags.Int("stats-port", 80, `Port for loadbalancer stats,
                 Used in the loadbalancer liveness probe.`)
 
 	startSyslog = flags.Bool("syslog", false, `if set, it will start a syslog server
@@ -140,6 +142,12 @@ var (
 
 	lbDefAlgorithm = flags.String("balance-algorithm", "roundrobin", `if set, it allows a custom
                 default balance algorithm.`)
+
+	selectors = flags.String("selectors", "", `Comma separated list of selectors
+                key:value pairings. to match service labels`)
+
+	nbproc  = flags.Int("nbproc", 1, `The maximum number of processes running haproxy.`)
+	maxconn = flags.Int("maxconn", 200000, `The maximum number of connections haproxy.`)
 )
 
 // service encapsulates a single backend entry in the load balancer config.
@@ -212,6 +220,10 @@ type loadBalancerConfig struct {
 	sslCert        string `json:"sslCert" description:"PEM for ssl."`
 	sslCaCert      string `json:"sslCaCert" description:"PEM to verify client's certificate."`
 	lbDefAlgorithm string `description:"custom default load balancer algorithm".`
+	httpPort       int    `json:"httpPort" description:"port for http service."`
+	httpsPort      int    `json:"httpsPort" description:"port for https service."`
+	nbproc         int    `json:"nbproc" description:"The maximum number of processes running haproxy."`
+	maxconn        int    `json:"nbproc" description:"The maximum number of connections haproxy."`
 }
 
 type staticPageHandler struct {
@@ -307,6 +319,10 @@ func (cfg *loadBalancerConfig) write(services map[string][]service, dryRun bool)
 
 	conf := make(map[string]interface{})
 	conf["startSyslog"] = strconv.FormatBool(cfg.startSyslog)
+	conf["httpPort"] = cfg.httpPort
+	conf["httpsPort"] = cfg.httpsPort
+	conf["nbproc"] = cfg.nbproc
+	conf["maxconn"] = cfg.maxconn
 	conf["services"] = services
 
 	var sslConfig string
@@ -354,7 +370,7 @@ type loadBalancerController struct {
 	targetService     string
 	forwardServices   bool
 	tcpServices       map[string]int
-	httpPort          int
+	svcSelectors      map[string]string
 }
 
 // getTargetPort returns the numeric value of TargetPort
@@ -414,6 +430,11 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 	for _, s := range services.Items {
 		if s.Spec.Type == api.ServiceTypeLoadBalancer {
 			glog.Infof("Ignoring service %v, it already has a loadbalancer", s.Name)
+			continue
+		}
+		selector := labels.Set(lbc.svcSelectors).AsSelector()
+		if !selector.Matches(labels.Set(s.Labels)) {
+			glog.Infof("Ignoring service %v, it lables(%v) is not equal to %v", s.Name, s.Labels, lbc.svcSelectors)
 			continue
 		}
 		for _, servicePort := range s.Spec.Ports {
@@ -487,7 +508,7 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 					}
 				}
 
-				newSvc.FrontendPort = lbc.httpPort
+				newSvc.FrontendPort = servicePort.Port
 				if newSvc.SslTerm == true {
 					httpsTermSvc = append(httpsTermSvc, newSvc)
 				} else {
@@ -543,7 +564,7 @@ func (lbc *loadBalancerController) worker() {
 }
 
 // newLoadBalancerController creates a new controller from the given config.
-func newLoadBalancerController(cfg *loadBalancerConfig, kubeClient *unversioned.Client, namespace string, tcpServices map[string]int) *loadBalancerController {
+func newLoadBalancerController(cfg *loadBalancerConfig, kubeClient *unversioned.Client, namespace string, tcpServices map[string]int, svcSelectors map[string]string) *loadBalancerController {
 	lbc := loadBalancerController{
 		cfg:    cfg,
 		client: kubeClient,
@@ -552,8 +573,8 @@ func newLoadBalancerController(cfg *loadBalancerConfig, kubeClient *unversioned.
 			reloadQPS, int(reloadQPS)),
 		targetService:   *targetService,
 		forwardServices: *forwardServices,
-		httpPort:        *httpPort,
 		tcpServices:     tcpServices,
+		svcSelectors:    svcSelectors,
 	}
 
 	enqueue := func(obj interface{}) {
@@ -610,7 +631,7 @@ func parseCfg(configPath string, defLbAlgorithm string, sslCert string, sslCaCer
 func registerHandlers(s *staticPageHandler) {
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// Delegate a check to the haproxy stats service.
-		response, err := http.Get(fmt.Sprintf("http://localhost:%v", *statsPort))
+		response, err := http.Get(fmt.Sprintf("http://localhost:%v/hastats", *statsPort))
 		if err != nil {
 			glog.Infof("Error %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -657,6 +678,21 @@ func parseTCPServices(tcpServices string) map[string]int {
 	return tcpSvcs
 }
 
+func parseSvcSelector(selectors string) map[string]string {
+	svcSelector := make(map[string]string)
+	for _, selector := range strings.Split(selectors, ",") {
+		parts := strings.Split(selector, ":")
+		if len(parts) != 2 {
+			glog.Errorf("Ignoring service selector %v", selector)
+			continue
+		} else {
+			svcSelector[parts[0]] = parts[1]
+		}
+	}
+
+	return svcSelector
+}
+
 func dryRun(lbc *loadBalancerController) {
 	var err error
 	for err = lbc.sync(true); err == errDeferredSync; err = lbc.sync(true) {
@@ -696,6 +732,11 @@ func main() {
 		}
 	}
 
+	cfg.httpPort = *httpPort
+	cfg.httpsPort = *httpsPort
+	cfg.nbproc = *nbproc
+	cfg.maxconn = *maxconn
+
 	if *cluster {
 		if kubeClient, err = unversioned.NewInCluster(); err != nil {
 			glog.Fatalf("Failed to create client: %v", err)
@@ -715,8 +756,12 @@ func main() {
 		namespace = api.NamespaceAll
 	}
 
+	var svcSelectors map[string]string
+	if *selectors != "" {
+		svcSelectors = parseSvcSelector(*selectors)
+	}
 	// TODO: Handle multiple namespaces
-	lbc := newLoadBalancerController(cfg, kubeClient, namespace, tcpSvcs)
+	lbc := newLoadBalancerController(cfg, kubeClient, namespace, tcpSvcs, svcSelectors)
 
 	go lbc.epController.Run(wait.NeverStop)
 	go lbc.svcController.Run(wait.NeverStop)
