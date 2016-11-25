@@ -1,8 +1,8 @@
 all: push
 
 # 0.0 shouldn't clobber any released builds
-TAG = 0.4
-PREFIX = gcr.io/google_containers/servicelb
+TAG = 1.6.4
+PREFIX = hub.oa.com/google_containers/servicelb
 HAPROXY_IMAGE = contrib-haproxy
 
 server: service_loadbalancer.go
@@ -12,7 +12,7 @@ container: server
 	docker build -t $(PREFIX):$(TAG) .
 
 push: container
-	gcloud docker push $(PREFIX):$(TAG)
+	#docker push $(PREFIX):$(TAG)
 
 clean:
 	# remove servicelb and contrib-haproxy images

@@ -121,8 +121,6 @@ var (
 	forwardServices = flags.Bool("forward-services", false, `Forward to service vip
                 instead of endpoints. This will use kube-proxy's inbuilt load balancing.`)
 
-	httpPort  = flags.Int("http-port", 8080, `Port to expose http services.`)
-	httpsPort = flags.Int("https-port", 443, `Port to expose https services.`)
 	statsPort = flags.Int("stats-port", 80, `Port for loadbalancer stats,
                 Used in the loadbalancer liveness probe.`)
 
@@ -146,8 +144,9 @@ var (
 	selectors = flags.String("selectors", "", `Comma separated list of selectors
                 key:value pairings. to match service labels`)
 
-	nbproc  = flags.Int("nbproc", 1, `The maximum number of processes running haproxy.`)
-	maxconn = flags.Int("maxconn", 200000, `The maximum number of connections haproxy.`)
+	startAcl = flags.Bool("acl", false, `if set, it will start acl rule.`)
+	nbproc   = flags.Int("nbproc", 1, `The maximum number of processes running haproxy.`)
+	maxconn  = flags.Int("maxconn", 200000, `The maximum number of connections haproxy.`)
 )
 
 // service encapsulates a single backend entry in the load balancer config.
@@ -220,10 +219,9 @@ type loadBalancerConfig struct {
 	sslCert        string `json:"sslCert" description:"PEM for ssl."`
 	sslCaCert      string `json:"sslCaCert" description:"PEM to verify client's certificate."`
 	lbDefAlgorithm string `description:"custom default load balancer algorithm".`
-	httpPort       int    `json:"httpPort" description:"port for http service."`
-	httpsPort      int    `json:"httpsPort" description:"port for https service."`
 	nbproc         int    `json:"nbproc" description:"The maximum number of processes running haproxy."`
 	maxconn        int    `json:"nbproc" description:"The maximum number of connections haproxy."`
+	startAcl       bool   `description:"start acl rule."`
 }
 
 type staticPageHandler struct {
@@ -319,11 +317,10 @@ func (cfg *loadBalancerConfig) write(services map[string][]service, dryRun bool)
 
 	conf := make(map[string]interface{})
 	conf["startSyslog"] = strconv.FormatBool(cfg.startSyslog)
-	conf["httpPort"] = cfg.httpPort
-	conf["httpsPort"] = cfg.httpsPort
 	conf["nbproc"] = cfg.nbproc
 	conf["maxconn"] = cfg.maxconn
 	conf["services"] = services
+	conf["startAcl"] = strconv.FormatBool(cfg.startAcl)
 
 	var sslConfig string
 	if cfg.sslCert != "" {
@@ -440,6 +437,7 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 		for _, servicePort := range s.Spec.Ports {
 			// TODO: headless services?
 			sName := s.Name
+			sNamePort := fmt.Sprintf("%s:%v", s.Name, servicePort.Port)
 			if servicePort.Protocol == api.ProtocolUDP ||
 				(lbc.targetService != "" && lbc.targetService != sName) {
 				glog.Infof("Ignoring %v: %+v", sName, servicePort)
@@ -491,14 +489,18 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 				if err == nil {
 					newSvc.SslTerm = b
 				}
+			} else {
+				if strings.HasPrefix(strings.ToLower(servicePort.Name), "https") {
+					newSvc.SslTerm = true 
+				}
 			}
 
 			if val, ok := serviceAnnotations(s.ObjectMeta.Annotations).getAclMatch(); ok {
 				newSvc.AclMatch = val
 			}
 
-			if port, ok := lbc.tcpServices[sName]; ok && port == servicePort.Port {
-				newSvc.FrontendPort = servicePort.Port
+			newSvc.FrontendPort = servicePort.Port
+			if _, ok := lbc.tcpServices[sNamePort]; ok {
 				tcpSvc = append(tcpSvc, newSvc)
 			} else {
 				if val, ok := serviceAnnotations(s.ObjectMeta.Annotations).getCookieStickySession(); ok {
@@ -507,8 +509,6 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 						newSvc.CookieStickySession = b
 					}
 				}
-
-				newSvc.FrontendPort = servicePort.Port
 				if newSvc.SslTerm == true {
 					httpsTermSvc = append(httpsTermSvc, newSvc)
 				} else {
@@ -671,10 +671,9 @@ func parseTCPServices(tcpServices string) map[string]int {
 			continue
 		} else {
 			glog.Infof("Adding TCP service %v", service)
-			tcpSvcs[portSplit[0]] = port
+			tcpSvcs[service] = port
 		}
 	}
-
 	return tcpSvcs
 }
 
@@ -689,7 +688,6 @@ func parseSvcSelector(selectors string) map[string]string {
 			svcSelector[parts[0]] = parts[1]
 		}
 	}
-
 	return svcSelector
 }
 
@@ -732,10 +730,9 @@ func main() {
 		}
 	}
 
-	cfg.httpPort = *httpPort
-	cfg.httpsPort = *httpsPort
 	cfg.nbproc = *nbproc
 	cfg.maxconn = *maxconn
+	cfg.startAcl = *startAcl
 
 	if *cluster {
 		if kubeClient, err = unversioned.NewInCluster(); err != nil {
