@@ -489,10 +489,10 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 				if err == nil {
 					newSvc.SslTerm = b
 				}
-			} else {
-				if strings.HasPrefix(strings.ToLower(servicePort.Name), "https") {
-					newSvc.SslTerm = true 
-				}
+			} else if strings.HasPrefix(strings.ToLower(servicePort.Name), "https") {
+				newSvc.SslTerm = true
+			} else if lbc.cfg.sslCert != "" {
+				newSvc.SslTerm = true
 			}
 
 			if val, ok := serviceAnnotations(s.ObjectMeta.Annotations).getAclMatch(); ok {
