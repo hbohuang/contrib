@@ -431,7 +431,7 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 		}
 		selector := labels.Set(lbc.svcSelectors).AsSelector()
 		if !selector.Matches(labels.Set(s.Labels)) {
-			glog.Infof("Ignoring service %v, it lables(%v) is not equal to %v", s.Name, s.Labels, lbc.svcSelectors)
+			//glog.Infof("Ignoring service %v, it lables(%v) is not equal to %v", s.Name, s.Labels, lbc.svcSelectors)
 			continue
 		}
 		for _, servicePort := range s.Spec.Ports {
@@ -478,7 +478,7 @@ func (lbc *loadBalancerController) getServices() (httpSvc []service, httpsTermSv
 
 			// By default sticky session is disabled
 			newSvc.SessionAffinity = false
-			if s.Spec.SessionAffinity != "" {
+			if s.Spec.SessionAffinity != "" && s.Spec.SessionAffinity != api.ServiceAffinityNone {
 				newSvc.SessionAffinity = true
 			}
 

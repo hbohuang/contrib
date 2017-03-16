@@ -1,7 +1,7 @@
 all: push
 
 # 0.0 shouldn't clobber any released builds
-TAG = 1.6.4
+TAG = 1.6.5-rc1
 PREFIX = hub.oa.com/google_containers/servicelb
 HAPROXY_IMAGE = contrib-haproxy
 
